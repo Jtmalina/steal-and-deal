@@ -1,0 +1,20 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# Export output
+/build/
+/export/
+export_presets.cfg
+
+# Third-party sound libraries (NOX_SOUND / A Sound Effect packs).
+# ~1.2 GB of WAVs that never change, are not ours to redistribute, and are
+# discovered at runtime by Sfx.gd scanning res://Sounds. Drop the packs back
+# in on a fresh clone -- see Sounds/README.md.
+/Sounds/*
+!/Sounds/README.md
+
+# OS / editor junk
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,11 @@
+Model Information:
+* title:	Kiri '94 Racemod - Low Poly model
+* source:	https://sketchfab.com/3d-models/kiri-94-racemod-low-poly-model-64d5d6f074a84717ac6d764f35c95285
+* author:	Daniel Zhabotinsky (https://sketchfab.com/DanielZhabotinsky)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Kiri '94 Racemod - Low Poly model" (https://sketchfab.com/3d-models/kiri-94-racemod-low-poly-model-64d5d6f074a84717ac6d764f35c95285) by Daniel Zhabotinsky (https://sketchfab.com/DanielZhabotinsky) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
