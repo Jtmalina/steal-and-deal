@@ -96,6 +96,13 @@ func place_at_corner(ix: int, iz: int, sx: int, sz: int) -> void:
 	dir = Vector3(0, 0, -1)
 	_rng.seed = int(_goal.x * 17.0 + _goal.z * 5.0) + 3
 
+## The same, for somebody already on that pavement: they walk to the corner
+## from where they are rather than being put on it.
+func head_for_corner(ix: int, iz: int, sx: int, sz: int) -> void:
+	var here := global_position
+	place_at_corner(ix, iz, sx, sz)
+	global_position = here
+
 ## Where one corner of a junction is. The pavements meet here and nowhere else.
 static func corner(ix: int, iz: int, sx: int, sz: int) -> Vector3:
 	return Vector3(World.ROADS[ix] + float(sx) * PAVE, 0.0, World.ROADS[iz] + float(sz) * PAVE)
@@ -130,6 +137,10 @@ func _physics_process(delta: float) -> void:
 	if down:
 		return
 	_hit_lull = maxf(0.0, _hit_lull - delta)
+	# a walk somewhere off the pavements comes first of all
+	if not _via.is_empty() and panic_until <= 0.0:
+		_walk_via(delta)
+		return
 	# an errand takes priority over the corner graph until it is done
 	if errand_until > 0.0 and panic_until <= 0.0:
 		errand_until -= delta
@@ -444,7 +455,7 @@ func take_damage(amount: int, from: Node) -> void:
 ## them is a copper -- or one of them can find a phone -- the police hear about it.
 func _witnessed(killer: Node3D) -> void:
 	var seen := false
-	for group in ["pedestrian", "police_foot"]:
+	for group in ["pedestrian", "police_foot", "staff"]:
 		for n in get_tree().get_nodes_in_group(group):
 			if n == self or not (n is Node3D):
 				continue
@@ -469,6 +480,50 @@ func _witnessed(killer: Node3D) -> void:
 ## street it reads as people using the buildings rather than circling them.
 var errand := Vector3.ZERO
 var errand_until := 0.0
+
+## Somewhere off the pavement grid, as a list of points to walk through: out
+## of a car park to the pavement having parked, or in to a car to drive it
+## off. `then` is called on arriving at the last one. Until then the corner
+## graph waits; afterwards they pick it back up wherever it had them going.
+var _via: Array = []
+var _via_then := Callable()
+var _via_time := 0.0
+
+func walk_via(points: Array, then: Callable = Callable()) -> void:
+	_via = points.duplicate()
+	_via_then = then
+	_via_time = 0.0
+
+func walking_via() -> bool:
+	return not _via.is_empty()
+
+func _walk_via(delta: float) -> void:
+	_via_time += delta
+	var to: Vector3 = (_via[0] as Vector3) - global_position
+	to.y = 0.0
+	# wedged on something for this long: there, near enough
+	if _via_time > 40.0:
+		var last: Vector3 = _via[_via.size() - 1]
+		global_position = Vector3(last.x, global_position.y, last.z)
+		to = Vector3.ZERO
+		_via = [last]
+	if to.length() < 0.6:
+		_via.pop_front()
+		if _via.is_empty():
+			var then := _via_then
+			_via_then = Callable()
+			if then.is_valid():
+				then.call()
+		return
+	var want := _around_obstacles(to.normalized() * walk_speed, delta)
+	velocity.x = want.x
+	velocity.z = want.z
+	velocity.y = -2.0 if is_on_floor() else velocity.y - GRAVITY * delta
+	move_and_slide()
+	if want.length() > 0.1:
+		dir = want.normalized()
+		_body.rotation.y = lerp_angle(_body.rotation.y, atan2(want.x, want.z), 0.15)
+	_rig.step(delta, Vector2(velocity.x, velocity.z).length())
 
 func run_errand(door: Vector3, secs: float) -> void:
 	if down or tumbling:

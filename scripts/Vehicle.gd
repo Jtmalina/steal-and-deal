@@ -69,6 +69,56 @@ var occupant: Node3D = null
 var occupant_seed := 0
 var passenger: Node3D = null
 
+# ------------------------------------------------------------
+#  Suspension
+# ------------------------------------------------------------
+## Everything that is bodywork hangs off this, and this hangs off the springs.
+## The wheels, the collision box and the label stay on the car itself, so the
+## wheels keep to the road while the body moves about above them.
+var _sprung: Node3D = null
+## One entry per wheel: {pid, pivot, base, g}. `base` is where its pivot sits
+## on flat ground; `g` is how far the ground under it is above or below that.
+var _corners: Array = []
+var _heave := 0.0
+var _heave_v := 0.0
+var _pitch := 0.0
+var _pitch_v := 0.0
+var _roll := 0.0
+var _roll_v := 0.0
+var _last_speed := 0.0
+var _last_yaw := 0.0
+## Seconds left before a car nobody is driving stops working its springs out.
+## A parked car that is not being touched costs nothing.
+var _susp_awake := 1.0
+var _sparks: CPUParticles3D = null
+## Stiffness and damping of the body on its springs, per second squared and per
+## second. About a hertz and a half and a third of critical: it dips, comes back
+## up a touch past level, and settles, the way a tired saloon does.
+const SPRING := 90.0
+const DAMP := 7.0
+## Nose-down per m/s^2 of braking, and lean per m/s^2 of cornering.
+const DIVE := 0.0065
+const LEAN := 0.0042
+const MAX_TILT := 0.2
+## Ground rays: from this far above the wheel to this far below it.
+const RAY_UP := 0.9
+const RAY_DOWN := 0.7
+## What dragging a bare hub along the tarmac costs, per missing wheel, in m/s^2.
+const SCRAPE_DRAG := 3.2
+## How much of the car's top speed, and of its pull, is left with 0..4 wheels gone.
+const LIMP_TOP := [1.0, 0.42, 0.12, 0.05, 0.0]
+const LIMP_PULL := [1.0, 0.55, 0.25, 0.12, 0.0]
+const WHEEL_IDS := ["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"]
+
+# ------------------------------------------------------------
+#  Dents
+# ------------------------------------------------------------
+## MeshInstance3D -> {mesh, prims, arrays, rest}. A mesh is only copied the first
+## time it gets hit: every car of a make shares one until then.
+var _dents := {}
+## Deepest any bit of metal is ever pushed in from where it started, in metres.
+const DENT_MAX := 0.3
+
 func setup(vehicle_data: Dictionary) -> void:
 	data = vehicle_data
 	condition = randf_range(0.55, 0.98)
@@ -85,6 +135,7 @@ func _ready() -> void:
 	add_to_group("shootable")
 	_build()
 	_rig_wheels()
+	_mount_sprung()
 	refresh_part_meshes()
 	if data.has("model") and not bool(data.get("fixed_paint", false)):
 		repaint(data.get("color", Color(0.6, 0.6, 0.6)))
@@ -502,11 +553,21 @@ func _add_box(size: Vector3, pos: Vector3, color: Color) -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
 	var mesh := BoxMesh.new()
 	mesh.size = size
+	# anything big enough to be a panel gets some vertices across it, or a dent
+	# in the middle of a door can only move its four corners
+	if size.x > 0.9 or size.z > 0.9:
+		mesh.subdivide_width = clampi(int(size.x / 0.35), 1, 8)
+		mesh.subdivide_depth = clampi(int(size.z / 0.35), 1, 10)
+		mesh.subdivide_height = clampi(int(size.y / 0.35), 1, 4)
 	mi.mesh = mesh
 	mi.position = pos
 	mi.material_override = _surface(color)
-	add_child(mi)
+	_body_root().add_child(mi)
 	return mi
+
+## Where bodywork goes: on the springs once they exist, on the car until then.
+func _body_root() -> Node3D:
+	return _sprung if _sprung != null and is_instance_valid(_sprung) else self
 
 ## Paint. Anything with an alpha on it is glass, and gets treated like it.
 func _surface(color: Color) -> StandardMaterial3D:
@@ -622,7 +683,7 @@ func _seat_body(dress_seed: int, uniform: bool, left: bool) -> Node3D:
 	who.position = seat_point(left) - Vector3(0, PersonMesh.HIP * fit, 0)
 	who.scale = Vector3.ONE * fit
 	who.rotation.y = PI          # everybody is built facing +Z, cars face -Z
-	add_child(who)
+	_body_root().add_child(who)
 	var rng := RandomNumberGenerator.new()
 	rng.seed = dress_seed
 	if uniform:
@@ -711,12 +772,18 @@ func _physics_process(delta: float) -> void:
 		rotate_y(spin * delta)
 		move_and_slide()
 		_check_impacts()
+		_susp_awake = maxf(_susp_awake, 1.5)
 	_settle_shove(delta)
+	if _susp_awake > 0.0:
+		_susp_awake -= delta
+		_suspend(delta)
 
-## Knocks decay quickly -- this is a shunt, not a launch.
+## Knocks decay quickly -- this is a shunt, not a launch. A car short of a wheel
+## has a hub dug into the road, and does not slide nearly as far.
 func _settle_shove(delta: float) -> void:
-	shove = shove.move_toward(Vector3.ZERO, delta * 18.0)
-	spin = move_toward(spin, 0.0, delta * 3.5)
+	var dig := 1.0 + float(missing_wheels()) * 1.5
+	shove = shove.move_toward(Vector3.ZERO, delta * 18.0 * dig)
+	spin = move_toward(spin, 0.0, delta * 3.5 * dig)
 	_crash_lull = maxf(0.0, _crash_lull - delta)
 
 ## Called every physics frame by whoever is driving (player or police AI).
@@ -725,8 +792,23 @@ func _settle_shove(delta: float) -> void:
 func drive(throttle: float, steer: float, delta: float, handbrake: bool = false) -> void:
 	var top: float = float(data.get("top_speed", 16.0))
 	var base: float = float(data.get("accel", 9.0))
-
-	_update_gear(absf(speed) / maxf(top, 0.001), delta)
+	# A wheel short and it is a different car: most of the top end and most of
+	# the pull gone, a hub grinding on the road the whole time, and the steering
+	# going with whichever front corner is not there. Lose a whole axle and it is
+	# not going anywhere under its own power -- it drags itself a few inches.
+	var gone := missing_wheels()
+	var gone_front := _missing_on(true)
+	if gone > 0:
+		var limp: float = LIMP_TOP[mini(gone, 4)]
+		if gone_front >= 2 or _missing_on(false) >= 2:
+			limp = minf(limp, 0.05)
+		top = maxf(top * limp, 0.8)
+		base *= LIMP_PULL[mini(gone, 4)]
+		# the gearbox still reads the healthy car's speed range, so the gears it
+		# shows are the gears it would be in
+		_update_gear(absf(speed) / maxf(float(data.get("top_speed", 16.0)), 0.001), delta)
+	else:
+		_update_gear(absf(speed) / maxf(top, 0.001), delta)
 	# smooth the steering input so keyboard taps are not on/off
 	_steer = move_toward(_steer, clampf(steer, -1.0, 1.0), delta * STEER_RATE)
 
@@ -750,12 +832,22 @@ func drive(throttle: float, steer: float, delta: float, handbrake: bool = false)
 	else:
 		speed = move_toward(speed, 0.0, base * 0.45 * delta)                 # coasting
 
+	if gone > 0:
+		# the bare hub, dragging whatever the throttle is doing
+		speed = move_toward(speed, 0.0, SCRAPE_DRAG * float(gone) * delta)
+
 	# steering: bites once the car is rolling, calms down as it speeds up
 	if absf(speed) > 0.25:
-		var ratio := clampf(absf(speed) / top, 0.0, 1.0)
+		var ratio := clampf(absf(speed) / maxf(float(data.get("top_speed", 16.0)), 0.001), 0.0, 1.0)
 		var turn := TURN_RATE * (1.0 - 0.5 * ratio) * (1.6 if handbrake else 1.0)
+		# no tyre on a front corner, nothing much to steer with
+		turn *= [1.0, 0.55, 0.1][mini(gone_front, 2)]
 		var ramp := clampf(absf(speed) / 3.5, 0.0, 1.0)
 		rotate_y(-_steer * turn * ramp * delta * signf(speed))
+		# and the corner that is on the floor hauls the car round towards it
+		var pull := _drag_pull()
+		if pull != 0.0:
+			rotate_y(pull * clampf(absf(speed) / 6.0, 0.0, 1.0) * delta * signf(speed))
 
 	var forward := -transform.basis.z
 	velocity.x = forward.x * speed + shove.x
@@ -770,6 +862,215 @@ func drive(throttle: float, steer: float, delta: float, handbrake: bool = false)
 	_roll_wheels(delta)
 
 	_check_impacts()
+	_susp_awake = 2.0
+	_suspend(delta)
+
+# ------------------------------------------------------------
+#  Wheels on the ground, and the body on its springs
+# ------------------------------------------------------------
+## Is that wheel still bolted on? A wheel the car was never given as a part --
+## a truck's -- is always there.
+func has_wheel(pid: String) -> bool:
+	if pid == "" or not (data.get("parts", []) as Array).has(pid):
+		return true
+	return parts_remaining.has(pid)
+
+func missing_wheels() -> int:
+	var n := 0
+	for pid in WHEEL_IDS:
+		if not has_wheel(pid):
+			n += 1
+	return n
+
+func _missing_on(front: bool) -> int:
+	var n := 0
+	for pid in (["wheel_fl", "wheel_fr"] if front else ["wheel_rl", "wheel_rr"]):
+		if not has_wheel(pid):
+			n += 1
+	return n
+
+## Which way the missing corners drag the nose, in radians a second. A corner
+## on the right digs in and swings the car right; one on each side cancels.
+func _drag_pull() -> float:
+	var pull := 0.0
+	for pid: String in WHEEL_IDS:
+		if has_wheel(pid):
+			continue
+		var right := pid.ends_with("r")
+		var front := pid.begins_with("wheel_f")
+		pull += (-1.0 if right else 1.0) * (0.45 if front else 0.25)
+	return pull
+
+## One step of the springs. Each wheel finds the ground under it; the body fits
+## a plane to where the wheels are holding it up, leans for how hard the car is
+## braking and turning, and chases all of that on a damped spring -- so a kerb
+## kicks the nose up and it bobs, a hard stop dips it, and a wheel that is not
+## there leaves that corner on the floor.
+func _suspend(delta: float) -> void:
+	if _sprung == null or not is_instance_valid(_sprung) or delta <= 0.0:
+		return
+	# on the ramp or up on stands the body is held square: the teardown puts
+	# every bolt where it is on a level car, and a car that sagged would move them
+	if is_job or lifted:
+		_heave = 0.0
+		_pitch = 0.0
+		_roll = 0.0
+		_heave_v = 0.0
+		_pitch_v = 0.0
+		_roll_v = 0.0
+		_sprung.transform = Transform3D.IDENTITY
+		for c in _corners:
+			if is_instance_valid(c.pivot):
+				(c.pivot as Node3D).position = c.base
+		return
+
+	var space := get_world_3d().direct_space_state if is_inside_tree() else null
+	var pts := []                   # [x, z, height the body is held at, weight]
+	var gone_any := false
+	for c in _corners:
+		var pivot := c.pivot as Node3D
+		if not is_instance_valid(pivot):
+			continue
+		var base: Vector3 = c.base
+		var g := 0.0
+		if space != null:
+			var from := global_transform * (base + Vector3(0, RAY_UP, 0))
+			var to := global_transform * (base - Vector3(0, RAY_DOWN, 0))
+			var q := PhysicsRayQueryParameters3D.create(from, to, RideSurface.LAYER)
+			var hit := space.intersect_ray(q)
+			if not hit.is_empty():
+				g = clampf((hit.position as Vector3).y - global_position.y, -0.35, 0.45)
+		c.g = g
+		var there := has_wheel(String(c.pid))
+		if there:
+			# the wheel itself rides the ground, whatever the body is doing
+			pivot.position = base + Vector3(0, g, 0)
+			pts.append([base.x, base.z, g, 1.0])
+		else:
+			# nothing under that corner but the hub: it sits down on it
+			gone_any = true
+			var drop := clampf(base.y - 0.18, 0.15, 0.42)
+			pts.append([base.x, base.z, g - drop, 6.0])
+
+	var fit := _fit_plane(pts)
+	var want_heave: float = fit[0]
+	var want_pitch: float = -atan(fit[1])
+	var want_roll: float = atan(fit[2])
+
+	# weight moving about: braking dips the nose, pulling away squats it, and
+	# cornering leans the body out of the turn
+	var accel := (speed - _last_speed) / delta
+	_last_speed = speed
+	var yaw_rate := wrapf(rotation.y - _last_yaw, -PI, PI) / delta
+	_last_yaw = rotation.y
+	if absf(yaw_rate) > 8.0:
+		yaw_rate = 0.0          # teleported or placed, not turning
+	if driver != null or absf(speed) > 0.2:
+		want_pitch += clampf(accel * DIVE, -0.06, 0.05)
+		want_roll += clampf(-yaw_rate * speed * LEAN, -0.07, 0.07)
+
+	var k := SPRING
+	var c_damp := DAMP
+	_heave_v += (k * (want_heave - _heave) - c_damp * _heave_v) * delta
+	_pitch_v += (k * (want_pitch - _pitch) - c_damp * _pitch_v) * delta
+	_roll_v += (k * (want_roll - _roll) - c_damp * _roll_v) * delta
+	_heave += _heave_v * delta
+	_pitch += _pitch_v * delta
+	_roll += _roll_v * delta
+	_heave = clampf(_heave, -0.5, 0.4)
+	_pitch = clampf(_pitch, -MAX_TILT, MAX_TILT)
+	_roll = clampf(_roll, -MAX_TILT, MAX_TILT)
+	_sprung.transform = Transform3D(Basis.from_euler(Vector3(_pitch, 0.0, _roll)),
+		Vector3(0, _heave, 0))
+
+	# a car with a corner on the floor throws sparks off it while it moves
+	_scrape_sparks(gone_any and absf(speed) > 1.0)
+
+	# nobody driving and nothing left to settle: stop paying for the rays
+	if driver == null and absf(speed) < 0.05 and shove.length() < 0.05 		and absf(_heave_v) + absf(_pitch_v) + absf(_roll_v) < 0.01 		and absf(want_heave - _heave) + absf(want_pitch - _pitch) + absf(want_roll - _roll) < 0.004:
+		_susp_awake = 0.0
+
+## Least-squares plane y = h + a*z + b*x through the points, weighted. Returns
+## [h, a, b]. Four wheels on a rectangle is the usual case, but a truck has six.
+static func _fit_plane(pts: Array) -> Array:
+	if pts.is_empty():
+		return [0.0, 0.0, 0.0]
+	# normal equations for [1, z, x] . [h, a, b] = y
+	var s := [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+	var r := [0.0, 0.0, 0.0]
+	for p in pts:
+		var row := [1.0, float(p[1]), float(p[0])]
+		var w := float(p[3])
+		for i in 3:
+			r[i] += w * row[i] * float(p[2])
+			for j in 3:
+				s[i][j] += w * row[i] * row[j]
+	var det := _det3(s)
+	if absf(det) < 1e-6:
+		var mean := 0.0
+		var wsum := 0.0
+		for p in pts:
+			mean += float(p[2]) * float(p[3])
+			wsum += float(p[3])
+		return [mean / maxf(wsum, 0.001), 0.0, 0.0]
+	var out := [0.0, 0.0, 0.0]
+	for col in 3:
+		var m := [s[0].duplicate(), s[1].duplicate(), s[2].duplicate()]
+		for i in 3:
+			m[i][col] = r[i]
+		out[col] = _det3(m) / det
+	return out
+
+static func _det3(m: Array) -> float:
+	return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) 		- m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) 		+ m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+
+## A knock through the springs: a shunt from the side rocks the body over, one
+## from the front pitches it back. `from_local` points from the car towards
+## whatever hit it, in the car's own space.
+func jolt(from_local: Vector3, strength: float) -> void:
+	var s := clampf(strength, 0.0, 3.0)
+	var flat := Vector3(from_local.x, 0.0, from_local.z)
+	if flat.length() > 0.01:
+		flat = flat.normalized()
+	# pushed away from the hit: struck on the right, the body rolls left
+	_roll_v += -flat.x * s * 0.9
+	_pitch_v += flat.z * s * 0.7
+	_heave_v += s * 0.35
+	_susp_awake = maxf(_susp_awake, 2.5)
+
+func _scrape_sparks(on: bool) -> void:
+	if not on:
+		if _sparks != null and is_instance_valid(_sparks):
+			_sparks.emitting = false
+		return
+	if _sparks == null or not is_instance_valid(_sparks):
+		_sparks = CPUParticles3D.new()
+		_sparks.amount = 36
+		_sparks.lifetime = 0.35
+		_sparks.direction = Vector3(0, 0.6, 1)
+		_sparks.spread = 50.0
+		_sparks.initial_velocity_min = 3.0
+		_sparks.initial_velocity_max = 6.5
+		_sparks.gravity = Vector3(0, -14, 0)
+		_sparks.scale_amount_min = 0.04
+		_sparks.scale_amount_max = 0.08
+		var quad := QuadMesh.new()
+		quad.size = Vector2(1, 1)
+		var mat := StandardMaterial3D.new()
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mat.albedo_color = Color(1.0, 0.75, 0.3)
+		mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+		quad.material = mat
+		_sparks.mesh = quad
+		add_child(_sparks)
+	# at whichever corner is on the road
+	for c in _corners:
+		if not has_wheel(String(c.pid)):
+			_sparks.position = Vector3((c.base as Vector3).x, 0.05, (c.base as Vector3).z)
+			break
+	# thrown out behind the way it is going
+	_sparks.direction = Vector3(0, 0.6, 1.0 if speed > 0.0 else -1.0)
+	_sparks.emitting = true
 
 ## Which gear the speed puts us in, and the little lull while it changes.
 func _update_gear(frac: float, delta: float) -> void:
@@ -792,6 +1093,7 @@ func _update_gear(frac: float, delta: float) -> void:
 func _rig_wheels() -> void:
 	_wheel_spin.clear()
 	_wheel_steer.clear()
+	_corners.clear()
 	for w in _wheels:
 		if not is_instance_valid(w):
 			continue
@@ -813,6 +1115,40 @@ func _rig_wheels() -> void:
 		# a car faces -Z, so anything ahead of the middle is a front wheel
 		if box.get_center().z < 0.0:
 			_wheel_steer.append(steer)
+		# which part this is, so the springs know when it has gone. A truck's
+		# wheels are not parts at all, and are never missing.
+		var pid := ""
+		for key in _part_meshes.keys():
+			if String(key).begins_with("wheel") and (_part_meshes[key] as Array).has(w):
+				pid = String(key)
+				break
+		_corners.append({"pid": pid, "pivot": steer, "base": steer.position, "g": 0.0,
+			"radius": maxf(0.2, box.size.y * 0.5)})
+
+## Lift the bodywork off the car and onto the springs. Called once the shell,
+## the doors and the wheel pivots all exist, so everything that is not a wheel,
+## the collision box or the label goes across in one go.
+func _mount_sprung() -> void:
+	_sprung = Node3D.new()
+	_sprung.name = "Sprung"
+	add_child(_sprung)
+	var pivots := []
+	for c in _corners:
+		pivots.append(c.pivot)
+	for child in get_children():
+		if child == _sprung or child is CollisionShape3D or child is Label3D or pivots.has(child):
+			continue
+		var keep: Transform3D = (child as Node3D).transform if child is Node3D else Transform3D()
+		remove_child(child)
+		_sprung.add_child(child, true)
+		if child is Node3D:
+			(child as Node3D).transform = keep
+	_heave = 0.0
+	_pitch = 0.0
+	_roll = 0.0
+	_heave_v = 0.0
+	_pitch_v = 0.0
+	_roll_v = 0.0
 
 ## The box a node's meshes fill, in the car's own space.
 func _node_bounds(node: Node3D) -> AABB:
@@ -850,12 +1186,24 @@ func _check_impacts() -> void:
 		var hit := get_slide_collision(i)
 		var who := hit.get_collider()
 		if who is Pedestrian:
-			(who as Pedestrian).run_over(self, driver if driver != null else self)
+			var p := who as Pedestrian
+			if absf(speed) > 7.0 and not p.tumbling and not p.down:
+				# somebody over the bonnet leaves a mark in it
+				var nose := global_transform * Vector3(0, _body_size().y * 0.62, -half_length * 0.7)
+				dent_at(nose, Vector3.DOWN * 0.6 + global_transform.basis.z * 0.4, absf(speed) * 0.03)
+			p.run_over(self, driver if driver != null else self)
 		elif who is Vehicle:
 			_crash_into(who as Vehicle, hit.get_normal())
-		elif absf(hit.get_normal().y) < 0.5 and absf(speed) >= 6.0:
-			condition = maxf(0.15, condition - 0.02)
-			speed *= 0.45
+		elif absf(hit.get_normal().y) < 0.5 and absf(speed) >= 3.0 and _crash_lull <= 0.0:
+			# a wall. The metal takes it where it met the wall, square on
+			var hard := absf(speed)
+			_crash_lull = 0.25
+			dent_at(hit.get_position(), hit.get_normal(), hard / 14.0)
+			jolt(global_transform.basis.inverse() * -hit.get_normal(), hard / 7.0)
+			if hard >= 6.0:
+				condition = maxf(0.15, condition - 0.02)
+				hurt_from(hit.get_position(), clampf(hard * 0.012, 0.02, 0.3))
+				speed *= 0.45
 
 ## Two cars. Both get knocked off their line, both lose paint, and a hard
 ## enough one leaves a piece of somebody's car in the road.
@@ -878,6 +1226,9 @@ func _crash_into(other: Vehicle, normal: Vector3) -> void:
 	shove -= into * closing * 0.2
 	speed *= 0.55
 	condition = maxf(0.1, condition - closing * 0.006)
+	# our end of it: the panel facing them goes in, and the body rocks back
+	dent_at(_skin_towards(other.global_position), -into, closing / 13.0)
+	jolt(global_transform.basis.inverse() * into, closing / 6.0)
 	if closing > 9.0:
 		_shed_a_part(into)
 		other._shed_a_part(-into)
@@ -891,6 +1242,10 @@ func take_shunt(push: Vector3, from: Node3D) -> void:
 	condition = maxf(0.1, condition - push.length() * 0.003)
 	# and the panel that actually took it takes most of it
 	hurt_from(from.global_position, clampf(push.length() * 0.05, 0.02, 0.5))
+	# pushed in where they struck, and rocked on the springs by it
+	var push_dir := push.normalized() if push.length() > 0.01 else Vector3.ZERO
+	dent_at(_skin_towards(from.global_position), push_dir, push.length() / 7.0)
+	jolt(global_transform.basis.inverse() * -push_dir, push.length() / 3.5)
 	speed *= 0.7
 	if is_job:
 		refresh_label()
@@ -1000,6 +1355,197 @@ func hurt_part(part_id: String, amount: float) -> void:
 		return
 	part_wear[part_id] = clampf(float(part_wear.get(part_id, 1.0)) - amount, 0.05, 1.0)
 	refresh_label()
+
+## The size of the car's collision box, which is also near enough its body.
+func _body_size() -> Vector3:
+	return data.get("body_size", Vector3(2.0, 1.3, 4.4)) as Vector3
+
+## The point on the outside of the car nearest something at `other`, in world
+## space, at about bumper-to-waist height. A crash only knows where the two cars
+## were, not where they touched, and this is where they touched.
+func _skin_towards(other: Vector3) -> Vector3:
+	var local := global_transform.affine_inverse() * other
+	var flat := Vector2(local.x, local.z)
+	if flat.length() < 0.01:
+		flat = Vector2(0, -1)
+	var size := _body_size()
+	var hx := size.x * 0.5
+	var hz := size.z * 0.5
+	# out from the middle along that line until it meets a side of the box
+	var t := minf(hx / maxf(absf(flat.x), 0.0001), hz / maxf(absf(flat.y), 0.0001))
+	var edge := flat * t
+	return global_transform * Vector3(edge.x, size.y * 0.42, edge.y)
+
+## Push the metal in. `at` is where it was hit and `push` which way it was
+## shoved, both in world space; `strength` is roughly 0 for a tap and 1 for a
+## proper smash. Every mesh on the body near the hit moves -- skin, trim, glass,
+## a door on its hinge -- by the same amount at the same place, so the panels
+## stay joined up. Wheels are on their own pivots and are left round.
+func dent_at(at: Vector3, push: Vector3, strength: float) -> void:
+	if _sprung == null or not is_instance_valid(_sprung) or strength < 0.04:
+		return
+	if push.length() < 0.001:
+		return
+	var s := clampf(strength, 0.0, 1.6)
+	var body_inv := _sprung.global_transform.affine_inverse()
+	var p_body: Vector3 = body_inv * at
+	var d_body: Vector3 = (body_inv.basis * push).normalized()
+	var radius := clampf(0.55 + s * 0.9, 0.5, 1.8)
+	var depth := clampf(s * 0.16, 0.02, 0.24)
+	for n in _descendants(_sprung):
+		var mi := n as MeshInstance3D
+		if mi == null or mi.mesh == null or not mi.visible:
+			continue
+		if _is_person(mi):
+			continue
+		_dent_mesh(mi, p_body, d_body, radius, depth)
+
+## Anybody sat in the car is not bodywork.
+func _is_person(n: Node) -> bool:
+	var at := n
+	while at != null and at != _sprung:
+		if at == occupant or at == passenger:
+			return true
+		at = at.get_parent()
+	return false
+
+func _dent_mesh(mi: MeshInstance3D, p_body: Vector3, d_body: Vector3,
+		radius: float, depth: float) -> void:
+	# from the body's space into this mesh's own, which on an imported car is
+	# scaled and turned a quarter
+	var to_mesh: Transform3D = mi.global_transform.affine_inverse() * _sprung.global_transform
+	var p := to_mesh * p_body
+	var d := (to_mesh.basis * d_body)
+	var per_metre := d.length()
+	if per_metre < 0.0001:
+		return
+	d = d.normalized()
+	var r := radius * per_metre
+	var deep := depth * per_metre
+	var most := DENT_MAX * per_metre
+	var box := mi.mesh.get_aabb().grow(r)
+	if not box.has_point(p):
+		return
+
+	var state: Dictionary = _dents.get(mi, {})
+	if state.is_empty():
+		state = _dent_state(mi)
+		if state.is_empty():
+			return
+
+	var r2 := r * r
+	var moved_any := false
+	var arrays_list: Array = state.arrays
+	for si in arrays_list.size():
+		var arrays: Array = arrays_list[si]
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var rest: PackedVector3Array = state.rest[si]
+		var moved := false
+		for vi in verts.size():
+			var v := verts[vi]
+			var off := v - p
+			var dist2 := off.length_squared()
+			if dist2 >= r2:
+				continue
+			var f := 1.0 - sqrt(dist2) / r
+			f = f * f * (3.0 - 2.0 * f)
+			# a little crumple, the same for every copy of a point so the seams
+			# between panels and cut pieces stay closed
+			var crumple := sin(rest[vi].x * 37.0 + rest[vi].y * 17.0) * cos(rest[vi].z * 23.0) * 0.25
+			var nv := v + d * deep * f * (1.0 + crumple)
+			var from_rest := nv - rest[vi]
+			if from_rest.length() > most:
+				nv = rest[vi] + from_rest.normalized() * most
+			verts[vi] = nv
+			moved = true
+		if moved:
+			arrays[Mesh.ARRAY_VERTEX] = verts
+			_renormal(arrays)
+			moved_any = true
+	if not moved_any:
+		return
+	# only a mesh that really bent is on the books, and it is on its own copy
+	_dents[mi] = state
+	var mesh: ArrayMesh = state.mesh
+	mesh.clear_surfaces()
+	for si in arrays_list.size():
+		mesh.add_surface_from_arrays(state.prims[si], arrays_list[si])
+		if state.mats[si] != null:
+			mesh.surface_set_material(si, state.mats[si])
+	mi.mesh = mesh
+
+## This mesh's own copy of its geometry, taken the first time it is hit, so the
+## other forty cars of the same model are not bent along with it.
+func _dent_state(mi: MeshInstance3D) -> Dictionary:
+	var src := mi.mesh
+	var arrays_list := []
+	var rest := []
+	var prims := []
+	var mats := []
+	for si in src.get_surface_count():
+		var prim := Mesh.PRIMITIVE_TRIANGLES
+		if src is ArrayMesh:
+			prim = (src as ArrayMesh).surface_get_primitive_type(si)
+		if prim != Mesh.PRIMITIVE_TRIANGLES:
+			return {}
+		var arrays := src.surface_get_arrays(si)
+		if arrays.is_empty() or arrays[Mesh.ARRAY_VERTEX] == null:
+			return {}
+		# nothing skinned or morphing goes through this
+		arrays[Mesh.ARRAY_BONES] = null
+		arrays[Mesh.ARRAY_WEIGHTS] = null
+		# custom channels need their format flags passed back in to survive a
+		# rebuild; nothing on a car shader reads them, so they go
+		for ch in [Mesh.ARRAY_CUSTOM0, Mesh.ARRAY_CUSTOM1, Mesh.ARRAY_CUSTOM2, Mesh.ARRAY_CUSTOM3]:
+			arrays[ch] = null
+		arrays_list.append(arrays)
+		rest.append((arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).duplicate())
+		prims.append(prim)
+		mats.append(src.surface_get_material(si))
+	if arrays_list.is_empty():
+		return {}
+	return {"mesh": ArrayMesh.new(), "arrays": arrays_list, "rest": rest,
+		"prims": prims, "mats": mats}
+
+## Normals worked out again from the bent triangles, so a dent catches the light.
+## Vertices the model shares between faces get the average of them; ones it
+## keeps separate for a hard edge keep their hard edge.
+static func _renormal(arrays: Array) -> void:
+	if arrays[Mesh.ARRAY_NORMAL] == null:
+		return
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var normals := PackedVector3Array()
+	normals.resize(verts.size())
+	var idx = arrays[Mesh.ARRAY_INDEX]
+	var tri: PackedInt32Array
+	if idx == null or (idx as PackedInt32Array).is_empty():
+		tri = PackedInt32Array(range(verts.size()))
+	else:
+		tri = idx
+	var t := 0
+	while t + 2 < tri.size():
+		var a := tri[t]
+		var b := tri[t + 1]
+		var c := tri[t + 2]
+		# Godot winds clockwise, so this is the outward face
+		var fn := (verts[c] - verts[a]).cross(verts[b] - verts[a])
+		normals[a] += fn
+		normals[b] += fn
+		normals[c] += fn
+		t += 3
+	var old: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
+	# whichever way round the model was wound, agree with the normals it came
+	# with rather than turning the whole panel inside out
+	var agree := 0.0
+	for i in normals.size():
+		agree += normals[i].dot(old[i])
+	var flip := -1.0 if agree < 0.0 else 1.0
+	for i in normals.size():
+		var n := normals[i] * flip
+		normals[i] = n.normalized() if n.length_squared() > 1e-12 else old[i]
+	arrays[Mesh.ARRAY_NORMAL] = normals
+	# tangents describe the old surface; the renderer will manage without
+	arrays[Mesh.ARRAY_TANGENT] = null
 
 ## Whatever was nearest the impact takes the worst of it, and the rest of the
 ## car takes a little. A shunt in the front should not devalue the boot lid.
@@ -1147,6 +1693,7 @@ func set_as_job() -> void:
 	locked = true
 	driver = null
 	speed = 0.0
+	_suspend(1.0 / 60.0)         # square on the ramp
 	_label.visible = true
 	refresh_label()
 
@@ -1157,6 +1704,7 @@ func release_job() -> void:
 	is_job = false
 	locked = false
 	hotwired = true
+	_susp_awake = 2.0
 	if lifted:
 		set_lifted(false)
 	refresh_label()
@@ -1214,12 +1762,17 @@ func set_lifted(on: bool) -> void:
 	if lifted == on:
 		return
 	lifted = on
+	_susp_awake = maxf(_susp_awake, 2.0)
+	_suspend(1.0 / 60.0)
 	var tw := create_tween()
 	tw.tween_property(self, "position:y", position.y + (0.55 if on else -0.55), 0.6)
 	if on:
 		for x in [-1.0, 1.0]:
 			for z in [-1.6, 1.6]:
-				_jack_stands.append(_add_box(Vector3(0.45, 0.55, 0.45), Vector3(x, 0.0, z), Color(0.85, 0.55, 0.1)))
+				# on the car, not on the springs: stands do not bob
+				var stand := _add_box(Vector3(0.45, 0.55, 0.45), Vector3(x, 0.0, z), Color(0.85, 0.55, 0.1))
+				stand.reparent(self, false)
+				_jack_stands.append(stand)
 	else:
 		for st in _jack_stands:
 			st.queue_free()
@@ -1232,5 +1785,7 @@ func remove_part(part_id: String, quality: float = 1.0) -> int:
 	set_part_mesh_visible(part_id, false)
 	if parts_remaining.is_empty():
 		stripped = true
+	# a wheel gone and that corner is about to go down on its hub
+	_susp_awake = maxf(_susp_awake, 3.0)
 	refresh_label()
 	return value

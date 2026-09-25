@@ -13,7 +13,7 @@ var _hud: HUD = null
 
 func _ready() -> void:
 	var args := OS.get_cmdline_user_args()
-	if args.has("--smoke") or args.has("--bench"):
+	if args.has("--smoke") or args.has("--bench") or args.has("--shots"):
 		_begin("new")
 		return
 	_menu = MainMenu.new()
@@ -62,6 +62,11 @@ func _begin(what: String) -> void:
 		else:
 			hud.toast("LOADED", "Back where you left off.")
 
+	if OS.get_cmdline_user_args().has("--shots"):
+		var tour := ShotTour.new()
+		tour.name = "ShotTour"
+		add_child(tour)
+
 	if OS.get_cmdline_user_args().has("--smoke"):
 		var smoke: Node = (load("res://scripts/SmokeTest.gd") as Script).new()
 		smoke.player = player
@@ -108,7 +113,8 @@ func _on_pause_choice(what: String) -> void:
 ## Everything the run built, taken back down so the front screen starts clean.
 func _tear_down() -> void:
 	for n in [_hud, _player, _world, get_node_or_null("PoliceDispatch"),
-			get_node_or_null("WorldEnvironment"), get_node_or_null("DayNight")]:
+			get_node_or_null("WorldEnvironment"), get_node_or_null("DayNight"),
+			get_node_or_null("Sun")]:
 		if n != null and is_instance_valid(n):
 			(n as Node).queue_free()
 	_hud = null
@@ -178,25 +184,31 @@ func _process(_d: float) -> void:
 
 func _build_environment() -> void:
 	var we := WorldEnvironment.new()
+	we.name = "WorldEnvironment"
 	var env := Environment.new()
 	var sky := Sky.new()
-	var psm := ProceduralSkyMaterial.new()
-	psm.sky_top_color = Color(0.25, 0.3, 0.42)
-	psm.sky_horizon_color = Color(0.55, 0.5, 0.45)
-	psm.ground_bottom_color = Color(0.15, 0.15, 0.14)
-	psm.ground_horizon_color = Color(0.4, 0.38, 0.34)
-	sky.sky_material = psm
+	var sky_mat := ShaderMaterial.new()
+	sky_mat.shader = preload("res://shaders/sky.gdshader")
+	sky.sky_material = sky_mat
+	# the sky is only looked at; the light it would give off is set by hand
+	# in DayNight, so its radiance map can stay tiny
+	sky.radiance_size = Sky.RADIANCE_SIZE_32
 	env.background_mode = Environment.BG_SKY
 	env.sky = sky
-	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-	env.ambient_light_energy = 0.6
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	env.ambient_light_color = Color(0.40, 0.42, 0.48)
+	env.ambient_light_energy = 1.0
+	env.reflected_light_source = Environment.REFLECTION_SOURCE_DISABLED
 	env.fog_enabled = true
-	env.fog_light_color = Color(0.55, 0.55, 0.6)
+	env.fog_light_color = Color(0.60, 0.67, 0.76)
 	env.fog_density = 0.004
+	# a little haze on the sky, not so much the stars drown in it
+	env.fog_sky_affect = 0.3
 	we.environment = env
 	add_child(we)
 
 	var sun := DirectionalLight3D.new()
+	sun.name = "Sun"
 	sun.rotation_degrees = Vector3(-52, -125, 0)
 	sun.light_energy = 1.0
 	sun.light_color = Color(1.0, 0.94, 0.82)
@@ -208,7 +220,7 @@ func _build_environment() -> void:
 	clock.name = "DayNight"
 	clock.sun = sun
 	clock.env = env
-	clock.sky = psm
+	clock.sky = sky_mat
 	add_child(clock)
 
 func _make_player() -> Player:

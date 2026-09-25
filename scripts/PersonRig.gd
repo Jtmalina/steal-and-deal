@@ -113,6 +113,41 @@ func sit() -> void:
 		arms[i].rotation = Vector3(-1.15, 0.0, (0.3 if i == 0 else -0.3))
 	body.position.y = _base_y
 
+## Busy with something where they stand, rather than going anywhere. `kind`:
+## "type" at a keyboard, "serve" reaching over a counter now and then,
+## "stock" arms up at a shelf, "sit" on a stool with their hands on the
+## counter, anything else just stood about. `t` is their own clock, so two
+## people at one bar are not in step.
+func work(kind: String, t: float) -> void:
+	if not ready():
+		return
+	var sat := kind == "sit"
+	for l in legs:
+		l.rotation = Vector3(-1.35 if sat else 0.0, 0.0, 0.0)
+	body.position.y = _base_y + (-0.42 if sat else sin(t * 1.3) * 0.008)
+	match kind:
+		"type":
+			for i in 2:
+				var side := 1.0 if i == 0 else -1.0
+				arms[i].rotation = Vector3(-0.95 + sin(t * 13.0 + side * 1.7) * 0.07, 0.0, side * 0.12)
+		"serve":
+			# mostly waiting, then over the counter with something, and back
+			var reach := maxf(0.0, sin(t * 0.9)) ** 6.0
+			arms[0].rotation = Vector3(-0.35, 0.0, 0.08)
+			arms[1].rotation = Vector3(-0.35 - reach * 1.05, 0.0, -0.08)
+		"stock":
+			var lift := 0.5 + 0.5 * sin(t * 1.6)
+			for i in 2:
+				var side := 1.0 if i == 0 else -1.0
+				arms[i].rotation = Vector3(-1.1 - lift * 0.45, 0.0, side * 0.1)
+		"sit":
+			for i in 2:
+				var side := 1.0 if i == 0 else -1.0
+				arms[i].rotation = Vector3(-0.9 + (sin(t * 0.7) * 0.25 if i == 1 else 0.0), 0.0, side * 0.2)
+		_:
+			for i in 2:
+				arms[i].rotation = Vector3(sin(t * 0.8 + float(i)) * 0.05, 0.0, 0.0)
+
 ## Drop everything back to standing, for somebody who is not on their feet.
 func slump() -> void:
 	if not ready():

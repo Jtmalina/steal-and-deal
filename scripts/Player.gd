@@ -225,9 +225,12 @@ func _seat_body() -> void:
 		return
 	var fit: float = current_vehicle.occupant_scale()
 	var hips: Vector3 = current_vehicle.seat_point(true) - Vector3(0, PersonMesh.HIP * fit, 0)
-	body_mesh.position = (current_vehicle.global_transform.basis * hips) - Vector3(0, 0.4, 0)
-	body_mesh.rotation.y = current_vehicle.rotation.y + PI
-	body_mesh.scale = Vector3.ONE * fit
+	# sat on the springs with the rest of the cabin, so a dip or a lean in the
+	# body takes the driver with it instead of leaving them poking through the roof
+	var cabin: Node3D = current_vehicle._body_root()
+	var seat := Transform3D(cabin.global_basis.orthonormalized() * Basis(Vector3.UP, PI),
+		cabin.global_transform * hips)
+	body_mesh.global_transform = seat.scaled_local(Vector3.ONE * fit)
 
 # ------------------------------------------------------------
 #  Interaction targeting: nearest thing roughly in front of you
@@ -438,6 +441,7 @@ func exit_vehicle() -> void:
 	v.speed = 0.0
 	current_vehicle = null
 	body_mesh.position = Vector3.ZERO
+	body_mesh.rotation = Vector3(0, body_mesh.rotation.y, 0)   # off the springs, stood upright
 	body_mesh.scale = Vector3.ONE
 	body_mesh.visible = true
 	$Collider.disabled = false

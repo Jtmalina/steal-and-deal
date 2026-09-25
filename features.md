@@ -137,6 +137,12 @@ Later. Wants garage tier and a work queue first.
 - **Plate swapping** as a third laundering step alongside respray and panels.
 - **Checkpoints** when the truck is hot — a reason to launder before a run.
 - **Weight affecting handling** on the truck, so a full load is a decision.
-- **Dents visible on the model** — the per-panel damage exists in data now but
-  nothing shows it.
+- **Panel beating** — dents show on the model now and cost value, but nothing
+  takes them out again. A station in the garage that pulls a panel back to its
+  rest mesh for a fee or a minigame.
+- **Car park jobs** — `LotLife` already knows when somebody has just parked and
+  walked off. A contact could phone in "silver saloon, car park on Pine St, driver
+  just left", with a clock running before they come back.
+- **Staff as witnesses** — receptionists and cashiers already see what you do;
+  one could hit a panic button that calls it in faster than a passer-by would.
 - **A phone/contacts screen** once there is more than one contact to hold.

@@ -36,8 +36,10 @@ const NAMES_Z := ["MAIN ST", "OAK ST", "PINE ST", "ELM ST", "VINE ST",
 	"CEDAR ST", "ALDER ST", "BIRCH ST"]
 
 ## Dress every pavement on the grid. `avoid` is a list of world positions that
-## want keeping clear -- the garage forecourt, the yard gate, the pound.
-static func dress(parent: Node3D, roads: Array, avoid: Array, rng: RandomNumberGenerator) -> void:
+## want keeping clear -- the garage forecourt, the yard gate, the pound. `drives`
+## are rectangles on the ground (x, z) where a car crosses the pavement.
+static func dress(parent: Node3D, roads: Array, avoid: Array, rng: RandomNumberGenerator,
+		drives: Array = []) -> void:
 	var root := Node3D.new()
 	root.name = "StreetKit"
 	parent.add_child(root)
@@ -46,8 +48,8 @@ static func dress(parent: Node3D, roads: Array, avoid: Array, rng: RandomNumberG
 		var c: float = roads[i]
 		for side: float in [-1.0, 1.0]:
 			# the pavement of the road running along X, and of the one along Z
-			_run(root, true, c, side, roads, avoid, rng)
-			_run(root, false, c, side, roads, avoid, rng)
+			_run(root, true, c, side, roads, avoid, rng, drives)
+			_run(root, false, c, side, roads, avoid, rng, drives)
 	_corners(root, roads)
 
 ## One pavement, block by block. Walking the whole length at a fixed stride and
@@ -55,7 +57,7 @@ static func dress(parent: Node3D, roads: Array, avoid: Array, rng: RandomNumberG
 ## the clear window between two junctions is barely wider than the stride. So
 ## each stretch of pavement is filled on its own terms instead.
 static func _run(root: Node3D, along_x: bool, c: float, side: float,
-		roads: Array, avoid: Array, rng: RandomNumberGenerator) -> void:
+		roads: Array, avoid: Array, rng: RandomNumberGenerator, drives: Array = []) -> void:
 	var out := side * ((NEAR + FAR) * 0.5)
 	var edges := [-110.0]
 	for r: float in roads:
@@ -76,6 +78,10 @@ static func _run(root: Node3D, along_x: bool, c: float, side: float,
 				if here.distance_to(keep) < 20.0:
 					skip = true
 					break
+			# nothing stood in a drive, or so close a car turning in clips it
+			for d: Rect2 in drives:
+				if d.grow(1.8).has_point(Vector2(here.x, here.z)):
+					skip = true
 			if skip:
 				continue
 			# facing the road, so benches and shelters look the right way

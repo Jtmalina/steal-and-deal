@@ -42,13 +42,103 @@ var _blink := 0.0
 var _rng := RandomNumberGenerator.new()
 ## Seconds of driving like somebody just tried to pull them out of it.
 var fleeing := 0.0
+## Who is at the wheel, when it has to be somebody in particular -- the person
+## who just walked up to it and got in. -1 is whoever.
+var dress_seed := -1
+
+## A manoeuvre off the grid: in through a gate, into a bay, back out of one.
+## Each step is [point, reverse, speed, gate]; `gate`, if valid, has to say yes
+## before the car sets off on that step (a gap in the traffic, say).
+var _path: Array = []
+var _path_then := Callable()
+var _path_time := 0.0
+## However a manoeuvre goes, it is over after this long: whatever was stuck
+## gets put where it was going.
+const PATH_GIVE_UP := 45.0
 
 func _ready() -> void:
 	super()
 	# somebody is driving it, which is what makes it worth taking off them
 	# whoever is at the wheel of a marked car is wearing the uniform that goes
 	# with it -- a cruiser driven by somebody in a t-shirt reads as a bug
-	add_occupant(int(global_position.x * 13.0 + global_position.z * 7.0) + 11, patrol)
+	var who := dress_seed if dress_seed >= 0 else int(global_position.x * 13.0 + global_position.z * 7.0) + 11
+	add_occupant(who, patrol)
+
+## Off the lanes and onto a list of points, until the last one, then `then`.
+func follow_path(steps: Array, then: Callable = Callable()) -> void:
+	_path = steps.duplicate()
+	_path_then = then
+	_path_time = 0.0
+	_next_dir = Vector3.ZERO
+	_committed = false
+
+## In a car park or on the way in or out of one, rather than in a lane.
+func manoeuvring() -> bool:
+	return not _path.is_empty()
+
+func _follow_path(delta: float) -> void:
+	_path_time += delta
+	if _path_time > PATH_GIVE_UP:
+		# wedged somewhere: be where it was going and get on with it
+		var last: Array = _path[_path.size() - 1]
+		global_position = Vector3((last[0] as Vector3).x, global_position.y, (last[0] as Vector3).z)
+		_end_path()
+		return
+	var step: Array = _path[0]
+	var goal: Vector3 = step[0]
+	var back: bool = step[1]
+	var want: float = step[2] if step.size() > 2 else 3.0
+	var gate: Callable = step[3] if step.size() > 3 else Callable()
+	stop_reason = "manoeuvre"
+	if gate.is_valid() and not bool(gate.call()):
+		stop_reason = "gap"
+		drive(-1.0 if absf(speed) > 0.4 else 0.0, 0.0, delta, absf(speed) <= 0.4)
+		return
+	# once it has set off on a step the gate has had its say
+	if gate.is_valid():
+		step.resize(3)
+	var local := global_transform.basis.inverse() * (goal - global_position)
+	local.y = 0.0
+	var last_step := _path.size() == 1
+	if local.length() < (0.7 if last_step else 1.8):
+		_path.pop_front()
+		if _path.is_empty():
+			_end_path()
+		return
+	# reversing, the tail is what is aimed: point it the way the goal is
+	var steer: float
+	if back:
+		steer = clampf(atan2(local.x, local.z) * 1.8, -1.0, 1.0)
+	else:
+		steer = clampf(atan2(local.x, -local.z) * 1.8, -1.0, 1.0)
+	if last_step:
+		want = minf(want, maxf(0.9, local.length() * 0.9))
+	# somebody walking through the car park has right of way, and so does
+	# anybody stood behind a car that is backing out
+	var blocked := not back and (_anything_close() < half_length + 1.2
+		or _walker_ahead() < half_length + 1.6)
+	var player := get_tree().get_first_node_in_group("player") as Node3D
+	if player and player.get("current_vehicle") == null:
+		var to_player := global_transform.basis.inverse() * (player.global_position - global_position)
+		if absf(to_player.x) < 2.2 and (to_player.z < 0.0) != back \
+				and absf(to_player.z) < half_length + 2.0:
+			blocked = true
+	if blocked:
+		stop_reason = "walker"
+		drive(-1.0 if speed > 0.4 else 0.0, steer, delta, speed <= 0.4)
+		return
+	if back:
+		drive(-1.0 if speed > -want else 0.0, steer, delta)
+	else:
+		drive(_throttle_for(want) if speed < want else 0.0, steer, delta)
+
+func _end_path() -> void:
+	_path.clear()
+	speed = 0.0
+	var then := _path_then
+	_path_then = Callable()
+	if then.is_valid():
+		then.call()
 
 ## A carjacking that did not come off. They are through the next set of lights
 ## whatever colour they are, round anybody in the way, and gone.
@@ -167,6 +257,9 @@ func _steer_target() -> Vector3:
 func _physics_process(delta: float) -> void:
 	if driver != null or is_job or not locked:
 		return                       # somebody stole it, or it is on the ramp
+	if not _path.is_empty():
+		_follow_path(delta)
+		return
 
 	if patrol and _join_the_chase(delta):
 		return

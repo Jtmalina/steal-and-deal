@@ -76,10 +76,12 @@ const BLOCKS := [-149.0, -106.0, -57.0, -7.0, 39.0, 90.0, 144.0]
 const PLOTS := [10.0, 11.0, 16.0, 12.0, 12.0, 17.0, 15.0]
 
 ## Buildings people go in and out of, and where the front door is.
-const DOORWAY_KINDS := ["shops", "grocery", "school", "church", "hotel", "bar", "towers"]
+const DOORWAY_KINDS := ["shops", "grocery", "school", "church", "hotel", "bar", "towers", "police", "fuel"]
 var doorways: Array[Vector3] = []
 ## The middle of the police station block, once one has been built.
 var station := Vector3.ZERO
+## The station's front door, which is where the officers on post stand about.
+var station_door := Vector3.ZERO
 
 var jobs: Array[Vehicle] = []
 ## Marked bays and driveways the districts left behind, for parking cars in.
@@ -98,6 +100,9 @@ var _next_tally := 0.0
 
 func _ready() -> void:
 	add_to_group("world")
+	# before anything that wants to put a kerb or a hump on it
+	RideSurface.begin(self)
+	_plan_lots()
 	_build_ground()
 	_build_roads()
 	_build_blocks()
@@ -238,7 +243,10 @@ func _sign_label(parent: Node, text: String, pos: Vector3, color: Color = Color(
 #  City
 # ------------------------------------------------------------
 func _build_ground() -> void:
-	_box(self, Vector3(900, 2, 900), Vector3(0, -1, 0), Color(0.22, 0.25, 0.2)).name = "Ground"
+	var ground := _box(self, Vector3(900, 2, 900), Vector3(0, -1, 0), Color(0.22, 0.25, 0.2)) as StaticBody3D
+	ground.name = "Ground"
+	# the wheels look for the ground on the ride layer, the same as for a kerb
+	ground.collision_layer = 1 | RideSurface.LAYER
 
 func _build_roads() -> void:
 	for c: float in ROADS:
@@ -258,12 +266,13 @@ func _build_roads() -> void:
 			_box(self, Vector3(3.5, 0.42, 0.4), Vector3(along, -0.16, c), Color(0.8, 0.75, 0.4), false)
 			_box(self, Vector3(0.4, 0.42, 3.5), Vector3(c, -0.16, along), Color(0.8, 0.75, 0.4), false)
 	_build_pavements()
+	_build_drives()
 	_build_crossings()
 	# and everything that stands on a pavement: shelters, benches, bins, name
 	# plates on the corners. Kept clear of the three places you actually go.
 	var kit := RandomNumberGenerator.new()
 	kit.seed = 90210
-	StreetKit.dress(self, ROADS, [GARAGE_POS, SCRAP_POS, IMPOUND_POS], kit)
+	StreetKit.dress(self, ROADS, [GARAGE_POS, SCRAP_POS, IMPOUND_POS], kit, _drives)
 
 ## The paved strip either side of every road, with a kerb along the edge of it.
 ## People walk down the middle of these -- it is the same line the crossings
@@ -286,12 +295,85 @@ func _build_pavements() -> void:
 				var mid: float = (run[0] + run[1]) * 0.5
 				# along Z, either side of a road that runs along X
 				_box(self, Vector3(length, 0.42, width), Vector3(mid, -0.18, c + side * middle), slab, false)
-				_box(self, Vector3(length, 0.5, 0.5),
-					Vector3(mid, -0.12, c + side * (ROAD_HALF + 0.25)), kerb, false)
 				# and the same for the roads running the other way
 				_box(self, Vector3(width, 0.42, length), Vector3(c + side * middle, -0.175, mid), slab, false)
-				_box(self, Vector3(0.5, 0.5, length),
-					Vector3(c + side * (ROAD_HALF + 0.25), -0.115, mid), kerb, false)
+				# The kerbs, broken where a drive crosses them -- a dropped kerb
+				# is how you know a car is meant to go in there. What is left is
+				# felt by the wheels as well as seen: ride over one and the car
+				# kicks up and settles.
+				for piece: Array in _kerb_pieces(run, c + side * (ROAD_HALF + 0.25), true):
+					var kl: float = piece[1] - piece[0]
+					var km: float = (piece[0] + piece[1]) * 0.5
+					_box(self, Vector3(kl, 0.5, 0.5), Vector3(km, -0.12, c + side * (ROAD_HALF + 0.25)), kerb, false)
+					RideSurface.add(Vector3(kl, 0.5, 0.5), Vector3(km, -0.12, c + side * (ROAD_HALF + 0.25)))
+				for piece: Array in _kerb_pieces(run, c + side * (ROAD_HALF + 0.25), false):
+					var kl: float = piece[1] - piece[0]
+					var km: float = (piece[0] + piece[1]) * 0.5
+					_box(self, Vector3(0.5, 0.5, kl), Vector3(c + side * (ROAD_HALF + 0.25), -0.115, km), kerb, false)
+					RideSurface.add(Vector3(0.5, 0.5, kl), Vector3(c + side * (ROAD_HALF + 0.25), -0.115, km))
+				# the pavement is a few centimetres proud of the road, and the
+				# wheels know that too
+				RideSurface.add(Vector3(length, 0.42, width - 0.5), Vector3(mid, -0.18, c + side * (middle + 0.25)))
+				RideSurface.add(Vector3(width - 0.5, 0.42, length), Vector3(c + side * (middle + 0.25), -0.175, mid))
+
+## Where the drives cross the pavement, as rectangles on the ground (x, z, w, d).
+## Worked out before the pavements go down, so the kerb can be dropped for them.
+var _drives: Array[Rect2] = []
+## Every car park in town, as Blocks.lot_plan lays it out, with the grid
+## indices of its block added as `xi` and `zi`.
+var lots: Array[Dictionary] = []
+
+## The car parks, planned before anything is built: the pavements need to know
+## where to drop the kerb, and the street furniture where not to stand.
+func _plan_lots() -> void:
+	lots.clear()
+	_drives.clear()
+	for xi in BLOCKS.size():
+		for zi in BLOCKS.size():
+			if String(DISTRICTS[xi][zi]) != "lot":
+				continue
+			var plan := Blocks.lot_plan(Vector3(BLOCKS[xi], 0, BLOCKS[zi]), PLOTS[xi], PLOTS[zi])
+			plan["xi"] = xi
+			plan["zi"] = zi
+			lots.append(plan)
+			# from the lot's edge out across the pavement to the kerb line, a
+			# little past it so the kerb is cut clean through
+			var reach := PAVE_BACK - ROAD_HALF + 0.3
+			var gate := Blocks.LOT_GATE
+			for g: Vector3 in [plan.entry, plan.exit]:
+				var out := -1.0 if g == plan.entry else 1.0
+				var x0 := g.x if out > 0.0 else g.x - reach
+				_drives.append(Rect2(x0, g.z - gate * 0.5, reach, gate))
+
+## The drives themselves: tarmac over the paving, a shade proud of it so it
+## reads, from the kerb to the gate.
+func _build_drives() -> void:
+	for d: Rect2 in _drives:
+		var mid := d.get_center()
+		_box(self, Vector3(d.size.x, 0.1, d.size.y), Vector3(mid.x, -0.01, mid.y), Color(0.24, 0.24, 0.26), false)
+
+## A run of kerb along `line`, with any drive crossing it cut out. `along_x`
+## means the kerb runs along X at z = line; otherwise along Z at x = line.
+func _kerb_pieces(run: Array, line: float, along_x: bool) -> Array:
+	var pieces := [[float(run[0]), float(run[1])]]
+	for d: Rect2 in _drives:
+		var across_lo := d.position.y if along_x else d.position.x
+		var across_hi := d.end.y if along_x else d.end.x
+		if line < across_lo or line > across_hi:
+			continue
+		var lo := d.position.x if along_x else d.position.y
+		var hi := d.end.x if along_x else d.end.y
+		var out := []
+		for p: Array in pieces:
+			if hi <= p[0] or lo >= p[1]:
+				out.append(p)
+				continue
+			if lo > p[0] + 0.05:
+				out.append([p[0], lo])
+			if hi < p[1] - 0.05:
+				out.append([hi, p[1]])
+		pieces = out
+	return pieces
 
 ## The stretches of a road between the carriageways that cross it, as
 ## [from, to] pairs. Anything that runs alongside a road is built in these and
@@ -363,6 +445,7 @@ func _build_blocks() -> void:
 	rng.seed = 20260830
 	_off_street.clear()
 	doorways.clear()
+	Blocks.interior_lights.clear()
 	for xi in BLOCKS.size():
 		for zi in BLOCKS.size():
 			var kind := String(DISTRICTS[xi][zi])
@@ -371,13 +454,18 @@ func _build_blocks() -> void:
 				continue
 			var centre := Vector3(BLOCKS[xi], 0, BLOCKS[zi])
 			_off_street.append_array(Blocks.build(self, kind, centre, rng,
-				minf(PLOTS[xi], PLOTS[zi])))
+				minf(PLOTS[xi], PLOTS[zi]), PLOTS[xi], PLOTS[zi]))
 			# somewhere for people to be coming out of, and for a copper to
 			# stand about outside
+			# the building's own front door where it has one to point at
+			var front := Blocks.door
+			if front == Vector3.INF:
+				front = centre + Vector3(0, 0, -minf(PLOTS[xi], PLOTS[zi]) * 0.35)
 			if kind in DOORWAY_KINDS:
-				doorways.append(centre + Vector3(0, 0, -minf(PLOTS[xi], PLOTS[zi]) * 0.35))
+				doorways.append(front)
 			if kind == "police":
 				station = centre
+				station_door = front
 
 ## Officers stood about outside the station, and a couple of cruisers in the
 ## yard. They are not on a call: they are at work, which is the point -- the
@@ -389,7 +477,9 @@ func _post_the_station() -> void:
 	for i in 3:
 		var cop := PoliceOfficer.new()
 		add_child(cop)
-		cop.global_position = station + Vector3(-3.0 + 3.0 * float(i), 0.2, 4.0)
+		# out front, either side of the steps -- not inside the building, where
+		# the desk sergeant already is
+		cop.global_position = station_door + Vector3([-3.2, 2.4, 3.9][i], 0.2, 0.1)
 		if cop.has_method("stand_post"):
 			cop.stand_post(cop.global_position)
 			station_posts.append(cop.global_position)
@@ -1055,19 +1145,24 @@ func _spawn_parked_cars() -> void:
 				break
 		if too_close:
 			continue
-		if _park_a_car(spot[0], float(spot[1]), rng):
+		if _park_a_car(spot[0], float(spot[1]), rng, spot[2] if (spot as Array).size() > 2 else {}):
 			taken.append(spot[0])
 
-## One car left where it was parked, facing either way down the space. False if
-## the space was no good and nothing went in it.
-func _park_a_car(at: Vector3, yaw: float, rng: RandomNumberGenerator) -> bool:
+## One car left where it was parked, facing either way down the space -- or,
+## in a marked bay (`info.fixed`), nose in the way the bay says. A car in a
+## car park remembers which bay, so the lot life knows it can drive it away.
+## False if the space was no good and nothing went in it.
+func _park_a_car(at: Vector3, yaw: float, rng: RandomNumberGenerator, info: Dictionary = {}) -> bool:
 	if at.distance_to(GARAGE_POS) < 20.0:
 		return false
 	var v := Vehicle.new()
 	v.setup(_pick_vehicle_def(rng, at).duplicate(true))
 	add_child(v)
 	v.global_position = at
-	v.rotation.y = yaw + (PI if rng.randf() < 0.5 else 0.0)
+	var flip := rng.randf() < 0.5
+	v.rotation.y = yaw + (PI if flip and not bool(info.get("fixed", false)) else 0.0)
+	if info.has("lot"):
+		v.set_meta("lot_bay", info)
 	return true
 
 
@@ -1168,3 +1263,7 @@ func _spawn_traffic() -> void:
 	var traffic := Traffic.new()
 	traffic.name = "Traffic"
 	add_child(traffic)
+	# and some of it using the car parks
+	var life := LotLife.new()
+	life.name = "LotLife"
+	add_child(life)

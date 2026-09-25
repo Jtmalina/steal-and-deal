@@ -21,6 +21,11 @@ func _ready() -> void:
 	# and only the day/night step is allowed to move it
 	GameState.minutes = 12.0 * 60.0
 	GameState.set_process(false)
+	# and nobody drives off in a car a check is using: the car park step makes
+	# its own comings and goings when it wants them
+	var life := world.get_node_or_null("LotLife") as LotLife
+	if life:
+		life.enabled = false
 
 func _process(delta: float) -> void:
 	if driving or watching or busy:
@@ -273,9 +278,16 @@ func _process(delta: float) -> void:
 				takes += n
 				if n == 0:
 					quiet.append(String(b))
-			assert(quiet.is_empty(), "sound banks with nothing in them: %s" % str(quiet))
-			assert(Sfx._take("step_walk") != null, "a footstep bank loaded no audio")
-			print("[SMOKE] %d sound banks, %d takes between them" % [banks.size(), takes])
+			# The packs themselves are not in git (Sounds/README.md). With none of
+			# them there at all every bank is empty, which says nothing about the
+			# paths -- so that is a note, and everything after this still runs.
+			# With some there, an empty bank is a broken path.
+			if takes == 0:
+				print("[SMOKE] no sound packs installed under Sounds/, bank paths not checked")
+			else:
+				assert(quiet.is_empty(), "sound banks with nothing in them: %s" % str(quiet))
+				assert(Sfx._take("step_walk") != null, "a footstep bank loaded no audio")
+				print("[SMOKE] %d sound banks, %d takes between them" % [banks.size(), takes])
 
 			# the truck you start with is a real one, on wheels of its own
 			var lorry := GameState.truck()
@@ -463,7 +475,9 @@ func _process(delta: float) -> void:
 					if kind in ["scrap", "impound"]:
 						continue
 					var centre := Vector3(World.BLOCKS[xi], 0, World.BLOCKS[zi])
-					var room: float = minf(World.PLOTS[xi], World.PLOTS[zi]) + 0.6
+					# each axis against its own plot: that is where the pavement starts
+					var room_x: float = World.PLOTS[xi] + 0.6
+					var room_z: float = World.PLOTS[zi] + 0.6
 					var worst_over := 0.0
 					var culprit := ""
 					# Only what this block put down. The nearest thing the next
@@ -471,14 +485,15 @@ func _process(delta: float) -> void:
 					# origin is inside 30 belongs to this one -- reach any
 					# further and every house is measured against its
 					# neighbour's plot as well as its own.
-					for n in _solids_near(centre, 30.0, ["Waterfront", "Yard", "Spur", "Ground"]):
+					for n in _solids_near(centre, 30.0, ["Waterfront", "Yard", "Spur", "Ground", "RideSurface"]):
 						var box: AABB = n.global_transform * _shape_box(n)
 						var dx: float = maxf(absf(box.position.x - centre.x),
 							absf(box.end.x - centre.x))
 						var dz: float = maxf(absf(box.position.z - centre.z),
 							absf(box.end.z - centre.z))
-						if maxf(dx, dz) - room > worst_over:
-							worst_over = maxf(dx, dz) - room
+						var past := maxf(dx - room_x, dz - room_z)
+						if past > worst_over:
+							worst_over = past
 							culprit = "%s %s %s" % [n.name, str(n.get_parent().name), str(box)]
 					if worst_over > 0.01:
 						over.append("%s at %d,%d by %.1fm (%s)" % [kind, xi, zi, worst_over, culprit])
@@ -1705,7 +1720,263 @@ func _check_road_rules() -> void:
 		parked.parts_remaining.size()])
 	for n in [victim, second, runner, parked]:
 		n.queue_free()
+	await _check_springs_and_dents()
+	await _check_staff()
+	await _check_lot_life()
 	busy = false
+
+## The car parks: gates in and out with the kerb dropped for them and kept
+## everywhere else, then a car off the road that turns in, parks and becomes a
+## parked car somebody could steal, and the same car driven back out by
+## somebody who walks up to it.
+func _check_lot_life() -> void:
+	var life := world.get_node("LotLife") as LotLife
+	assert(world.lots.size() >= 2, "only %d car parks" % world.lots.size())
+	assert(world._drives.size() == world.lots.size() * 2, "a car park without both its gates")
+	for plan: Dictionary in world.lots:
+		assert((plan.bays as Array).size() >= 3, "a car park with %d bays" % (plan.bays as Array).size())
+	# no kerb left standing across a drive -- the kerbs are the narrow ride bodies
+	var kerbs := 0
+	for n in RideSurface.root.get_children():
+		var body := n as StaticBody3D
+		if body == null:
+			continue
+		var box: AABB = body.global_transform * _shape_box(body)
+		if minf(box.size.x, box.size.z) > 0.6 or box.size.y < 0.45:
+			continue
+		kerbs += 1
+		for d: Rect2 in world._drives:
+			var over := d.grow(-0.05).intersects(Rect2(box.position.x, box.position.z, box.size.x, box.size.z))
+			assert(not over, "a kerb across the drive at %s" % str(d.get_center()))
+	assert(kerbs > 100, "only %d lengths of kerb in the whole city" % kerbs)
+
+	# --- in ---
+	var plan: Dictionary = world.lots[0]
+	var e: Vector3 = plan.entry
+	var saved := player.global_position
+	player.global_position = (plan.centre as Vector3) + Vector3(0, 0.2, float(plan.pz) + 7.0)
+	var car := TrafficCar.new()
+	car.setup(GameData.vehicle_by_id("sedan").duplicate(true))
+	world.add_child(car)
+	car.global_position = Vector3(float(plan.entry_lane), 0.3, e.z + 22.0)
+	car.rotation.y = 0.0
+	car.set_route(Vector3(0, 0, -1), int(plan.xi), int(plan.zi) + 1, int(plan.zi))
+	var paint: Color = car.data.color
+	var was_in := life.pulled_in
+	assert(life.pull_in(plan, car), "a car in the lane would not turn in")
+	var waited := 0.0
+	while life.pulled_in == was_in and waited < 45.0:
+		await get_tree().create_timer(0.5).timeout
+		waited += 0.5
+	assert(life.pulled_in > was_in, "the car never got into a bay (%s, at %s)" % [
+		car.stop_reason if is_instance_valid(car) else "gone",
+		str(car.global_position) if is_instance_valid(car) else "-"])
+	var parked: Vehicle = null
+	for n in get_tree().get_nodes_in_group("vehicle"):
+		if n is TrafficCar or not (n as Vehicle).has_meta("lot_bay"):
+			continue
+		if (n as Vehicle).data.get("color") == paint:
+			parked = n
+	assert(parked != null, "whatever pulled in is not parked there now")
+	assert(parked.locked and parked.driver == null, "the parked car is left open")
+	var bay: Dictionary = plan.bays[int((parked.get_meta("lot_bay") as Dictionary).bay)]
+	assert(absf(wrapf(parked.rotation.y - float(bay.yaw), -PI, PI)) < 0.05, "parked across the bay")
+	var walking := 0
+	for n in get_tree().get_nodes_in_group("pedestrian"):
+		if (n as Pedestrian).walking_via() and (n as Node3D).global_position.distance_to(parked.global_position) < 20.0:
+			walking += 1
+	assert(walking >= 1, "nobody got out of the car that parked")
+	var took_in := waited
+
+	# --- and out again ---
+	var was_out := life.pulled_out
+	await get_tree().create_timer(1.0).timeout
+	assert(life.pull_out(plan, parked), "nobody would drive the parked car away")
+	waited = 0.0
+	while life.pulled_out == was_out and waited < 70.0:
+		await get_tree().create_timer(0.5).timeout
+		waited += 0.5
+	assert(life.pulled_out > was_out, "the car never left the car park")
+	var leaving: TrafficCar = null
+	for n in get_tree().get_nodes_in_group("vehicle"):
+		if n is TrafficCar and (n as Vehicle).data.get("color") == paint:
+			leaving = n
+	assert(leaving != null and not leaving.manoeuvring(), "whatever drove out is not in the traffic")
+	assert(absf(leaving.global_position.x - float(plan.exit_lane)) < 1.8,
+		"it came out %.1fm off its lane" % absf(leaving.global_position.x - float(plan.exit_lane)))
+	assert(leaving.occupant != null, "it drove off with nobody in it")
+	player.global_position = saved
+	print("[SMOKE] car parks: %d lots, %d bays, kerbs dropped at %d gates; parked in %.0fs, out and into the lane in %.0fs" % [
+		world.lots.size(), world.lots.reduce(func(a, p): return a + (p.bays as Array).size(), 0),
+		world._drives.size(), took_in, waited])
+
+## People at work inside the buildings: there are some, they are not part of
+## the street's head count, they are at their posts doing their jobs, nobody
+## has been built into a wall, and they see what happens in front of them.
+func _check_staff() -> void:
+	var staff := get_tree().get_nodes_in_group("staff")
+	assert(staff.size() >= 20, "only %d people at work in the whole city" % staff.size())
+	var trades := {}
+	for s: Staff in staff:
+		assert(not s.is_in_group("pedestrian"), "somebody at work is counted as a walker")
+		trades[s.trade] = true
+	for want in ["reception", "office", "bar", "shop", "police", "patron"]:
+		assert(trades.has(want), "nobody works as %s" % want)
+	# go and stand in the hotel lobby, and give them a moment
+	var desk: Staff = null
+	for s: Staff in staff:
+		if s.trade == "reception":
+			desk = s
+			break
+	var saved := player.global_position
+	player.global_position = desk.posts[0].at + Vector3(0, 0.2, -4.0)
+	var near := []
+	for s: Staff in staff:
+		if s.global_position.distance_to(player.global_position) < 40.0:
+			near.append(s)
+	await get_tree().create_timer(2.5).timeout
+	var working := 0
+	for s: Staff in near:
+		if not is_instance_valid(s) or s.down:
+			continue
+		# a post nobody can reach, or somebody shoved off theirs by a wall they
+		# were built inside, shows up as nobody being at any post at all
+		var closest := 1.0e9
+		for p: Dictionary in s.posts:
+			closest = minf(closest, Vector2(s.global_position.x - p.at.x, s.global_position.z - p.at.z).length())
+		assert(closest < 1.5, "a %s is %.1fm from every post they have" % [s.trade, closest])
+		if s.doing() != "":
+			working += 1
+	assert(working >= near.size() / 2, "%d of %d at the hotel are doing anything" % [working, near.size()])
+	# anybody at work sees a killing in front of them the same as a passer-by
+	GameState.set_wanted(0)
+	var victim := Pedestrian.new()
+	world.add_child(victim)
+	victim.global_position = desk.global_position + Vector3(0, 0, -2.2)
+	await get_tree().physics_frame
+	victim._witnessed(player)
+	assert(GameState.wanted >= 2, "the receptionist watched a killing and did nothing")
+	victim.queue_free()
+	GameState.set_wanted(0)
+	player.global_position = saved
+	print("[SMOKE] staff: %d at work in %d trades, %d of %d by the hotel busy, and they witness" % [
+		staff.size(), trades.size(), working, near.size()])
+
+## The body rides on springs, the wheels ride the ground, a wheel that is not
+## there leaves its corner on the floor and the car barely drivable, and a
+## smash leaves the metal pushed in.
+func _check_springs_and_dents() -> void:
+	var car := world.spawn_vehicle("rustbucket", Vector3(330, 0, 330))
+	car.global_position.y = 0.05
+	car.locked = false
+	car.hotwired = true
+	await get_tree().physics_frame
+	car.driver = self
+	# flat out, then stand on the brakes: the nose goes down
+	for f in 90:
+		car.drive(1.0, 0.0, 1.0 / 60.0)
+		await get_tree().physics_frame
+	var squat := car._pitch
+	var dive := 0.0
+	for f in 40:
+		car.drive(-1.0, 0.0, 1.0 / 60.0)
+		dive = minf(dive, car._pitch)
+		await get_tree().physics_frame
+	assert(dive < -0.01, "braking hard did not dip the nose (%.3f)" % dive)
+	# and a hard turn leans it out of the corner
+	for f in 60:
+		car.drive(1.0, -1.0, 1.0 / 60.0)
+		await get_tree().physics_frame
+	var lean := car._roll
+	assert(absf(lean) > 0.008, "cornering did not lean the body (%.3f)" % lean)
+	for f in 120:
+		car.drive(-1.0, 0.0, 1.0 / 60.0)
+		await get_tree().physics_frame
+
+	# a wheel off: that corner goes down on its hub
+	var fr: Dictionary = {}
+	for c in car._corners:
+		if String(c.pid) == "wheel_fr":
+			fr = c
+	assert(not fr.is_empty(), "the front right wheel is not on a corner of its own")
+	car.remove_part("wheel_fr", 0.4)
+	car.driver = null
+	for f in 90:
+		await get_tree().physics_frame
+	var corner_now: Vector3 = car._sprung.transform * (fr.base as Vector3)
+	var sag := (fr.base as Vector3).y - corner_now.y
+	assert(sag > 0.08, "the corner with no wheel on it is still held up (%.2fm)" % sag)
+
+	# three wheels: it limps
+	car.driver = self
+	car.speed = 0.0
+	var top := float(car.data.top_speed)
+	for f in 240:
+		car.drive(1.0, 0.0, 1.0 / 60.0)
+		await get_tree().physics_frame
+	var limp := car.speed
+	assert(limp < top * 0.5, "three wheels and it still does %.1f of %.1f" % [limp, top])
+	var yawed := absf(wrapf(car.rotation.y, -PI, PI))
+	# two fronts gone: nothing to steer on and nothing to roll on at that end
+	car.remove_part("wheel_fl", 0.4)
+	car.speed = 0.0
+	for f in 180:
+		car.drive(1.0, 1.0, 1.0 / 60.0)
+		await get_tree().physics_frame
+	assert(absf(car.speed) < 1.0, "no front wheels and it still drives at %.1f m/s" % car.speed)
+	print("[SMOKE] springs: squat %.3f, dive %.3f, lean %.3f; a missing wheel drops its corner %.2fm, three wheels tops out at %.1f of %.0f and drags %.2f rad off line, no fronts %.1f m/s" % [
+		squat, dive, lean, sag, limp, top, yawed, absf(car.speed)])
+	car.driver = null
+
+	# dents: a smash into the side of a car moves the metal where it hit
+	var hit := world.spawn_vehicle("rustbucket", Vector3(345, 0, 330))
+	hit.global_position.y = 0.05
+	await get_tree().physics_frame
+	var at := hit._skin_towards(hit.global_position + Vector3(10, 0, 0))
+	hit.dent_at(at, Vector3(-1, 0, 0), 1.0)
+	var deepest := 0.0
+	for mi in hit._dents.keys():
+		var st: Dictionary = hit._dents[mi]
+		var scale := (mi as MeshInstance3D).global_transform.basis.x.length()
+		for si in (st.arrays as Array).size():
+			var now: PackedVector3Array = st.arrays[si][Mesh.ARRAY_VERTEX]
+			var was: PackedVector3Array = st.rest[si]
+			for i in now.size():
+				deepest = maxf(deepest, (now[i] - was[i]).length() * scale)
+	assert(not hit._dents.is_empty(), "a smash dented nothing")
+	assert(deepest > 0.05 and deepest <= Vehicle.DENT_MAX + 0.01,
+		"the dent is %.3fm deep" % deepest)
+	# another car of the same make is not bent along with it
+	var twin := world.spawn_vehicle("rustbucket", Vector3(360, 0, 330))
+	await get_tree().physics_frame
+	assert(twin._dents.is_empty(), "denting one car bent another")
+	for mi in hit._dents.keys():
+		for other in twin._descendants(twin):
+			if other is MeshInstance3D:
+				assert((other as MeshInstance3D).mesh != (mi as MeshInstance3D).mesh,
+					"two cars share the dented mesh")
+	print("[SMOKE] dents: %d meshes bent, deepest %.2fm, the next car of the same make untouched" % [
+		hit._dents.size(), deepest])
+
+	# a kerb is felt: stand a front wheel on one and that corner rides up
+	var kerb_z: float = World.ROADS[4] + World.ROAD_HALF + 0.25
+	var probe := world.spawn_vehicle("sedan", Vector3(-7.0, 0, 0))
+	await get_tree().physics_frame
+	var front: Dictionary = {}
+	for c in probe._corners:
+		if (c.base as Vector3).z < 0.0:
+			front = c
+			break
+	probe.global_position = Vector3(-7.0, 0.02, kerb_z - (front.base as Vector3).z)
+	probe.rotation.y = 0.0
+	probe._susp_awake = 2.0
+	for f in 30:
+		probe._suspend(1.0 / 60.0)
+		await get_tree().physics_frame
+	assert(float(front.g) > 0.08, "a wheel on the kerb did not ride up it (%.2f)" % float(front.g))
+	print("[SMOKE] a wheel on the kerb rides %.2fm up it" % float(front.g))
+	for n in [car, hit, twin, probe]:
+		n.queue_free()
 
 ## Writing the shop down and reading it back onto a different shop.
 func _check_save() -> void:

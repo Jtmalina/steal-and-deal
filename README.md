@@ -21,6 +21,15 @@ Headless check of the whole loop (steal → deliver → dismantle → sell → u
 godot --headless --path . --quit-after 2000 -- --smoke
 ```
 
+A fly-through that saves a PNG of each set piece (street at noon, the tower lobby, the
+bar, a car park, dawn, dusk, the towers at night...) — windowed, since headless draws nothing:
+
+```bash
+godot --path . --resolution 1280x720 -- --shots --shots-dir=shots
+```
+
+Add `--shot=bar_inside` for just the one. The list is `ShotTour.SHOTS`.
+
 ## Controls
 
 | Key | Action |
@@ -188,6 +197,15 @@ stripped car away, or four crushed ones.
 | `scripts/PartMesh.gd` | One place that knows what every part looks like. |
 | `scripts/Interactable.gd` | Generic `[E]` prop — prompt + callable. |
 | `scripts/SmokeTest.gd` | Headless run-through of the whole loop. |
+| `scripts/Blocks.gd` | What stands on each block: towers, shops, houses, the hotel, bar, grocery, police station, car parks... and the rooms inside them. |
+| `scripts/Staff.gd` | Somebody at work inside a building, moving between posts (desk, till, shelves, stool). |
+| `scripts/LotLife.gd` | Cars turning into the car parks and parking, and people walking in and driving parked cars away. |
+| `scripts/DayNight.gd` | The sun, the moon, ambient and fog through the day; which street lamps and room lights are real lights. |
+| `scripts/RideSurface.gd` | Kerbs, humps and ramps only the wheels feel: the car rides over them instead of stopping. |
+| `scripts/StreetKit.gd` | Pavement furniture: lamps, shelters, benches, bins, name plates. |
+| `scripts/ShotTour.gd` | The `--shots` fly-through. |
+| `shaders/sky.gdshader` | Sky colour by hour, sun and glare, the moon, stars, and drifting clouds lit from below at dusk. |
+| `shaders/facade.gdshader` | Windows on every wall, a storey apart; some lit after dark, the same ones every night. |
 
 ## Extending it
 
@@ -342,6 +360,62 @@ It asserts: nobody over a centre line by more than 1.5 m, no two footprints over
 more than 0.25 m, fewer than 15 frames of anyone stalled inside a junction, no car within
 1.6 m of somebody on foot, somebody waited at a kerb, and somebody stopped at a red.
 
+## The city
+
+Every block is laid out by hand in `World.DISTRICTS` and built by `Blocks.gd` out of one
+shared unit cube, scaled per box. The walls wear `shaders/facade.gdshader`, which draws a
+grid of windows a storey apart and centred on each face. A tall block gets more floors
+rather than taller windows. After dark some windows light up, warm or the blue of a screen,
+chosen by a hash of the window so it is the same office light every night.
+
+- **Towers** have a lobby under them, a setback crown and plant on the roof. Next to
+  each is a lower block of offices over shops.
+- **Interiors you can walk into.** The tower lobbies, the hotel reception, the police front
+  counter, the bar and the grocery all have real rooms: a glass front, a desk or counter,
+  furniture, and a ceiling panel. **Staff** (`Staff.gd`) work in them: receptionists
+  typing, a desk sergeant, bar staff serving and restocking the back bar, a cashier, a
+  shelf stacker, and customers sat waiting or on stools. Each has a few posts and moves
+  between them in uniform, and past 75 m they hold still to save the time. They are
+  people like anyone on the pavement, so they see what you do and run from gunfire. The
+  traffic neither counts them nor clears them away. Only the five rooms nearest the camera
+  get a real light; from further off, the panel and the glass are enough.
+- **Car parks** have a way in and a way out. Each gate has a dropped kerb, a barrier arm,
+  an IN or OUT sign, arrows painted down a one-way aisle, and a speed hump halfway down.
+- **People use them** (`LotLife.gd`). Every 12–26 s, at the car park nearest you, either
+  a car in the lane outside indicates, turns in, finds a free bay, noses into it, and the
+  driver gets out and walks off, or somebody walks in off the pavement to a parked car,
+  backs it out and leaves by the other gate. Either way it is a real parked car. The one
+  that just pulled in can be stolen, and one you were eyeing up can be driven away from
+  under you, but never one you are stood within 14 m of.
+
+### Sky and time of day
+
+`shaders/sky.gdshader` paints the sky by the hour: a blue day, orange and pink at dawn and
+dusk, a deep night. It adds a sun disc with glare, and a moon with maria. After dark come
+stars, which twinkle and wheel slowly about the pole and are washed out low down by the
+city's glow. Clouds drift over the top and catch the low sun. `DayNight.gd` moves the sun
+up out of the east, over the south and down into the west. The moon keeps roughly opposite
+hours and lights the city blue at night. Ambient light and fog follow the hour, and the
+facade windows switch on as it gets dark. Of the two hundred street lamps, only the 14
+nearest you carry a real light. The rest glow on their own.
+
+## Car handling
+
+- **Suspension.** The bodywork hangs on springs above the wheels, at about 1.5 Hz and a
+  third of critical damping. It dives under braking, leans in corners, and pitches as each
+  axle rides over a kerb, a hump or a dropped kerb. Those are `RideSurface` shapes that
+  only the wheels' ground rays see, so the car rides over them instead of stopping dead.
+  A parked car settles and then costs nothing.
+- **Dents.** A crash pushes the metal in where it was hit, by up to 30 cm, falling off
+  with distance from the impact and never springing back. The panel nearest the impact
+  takes the worst of the value loss. A mesh is only copied the first time it is hit, so
+  undamaged cars of a make still share one.
+- **Wheels** hang off their own pivots: they roll for the ground covered, steer, and sit
+  on the road at each corner. Take one off and the car drops onto that corner's hub.
+  One wheel gone leaves about 40% of the top speed, and the hub drags and pulls the car
+  towards the missing side. With a whole axle gone, front or back, it only drags itself
+  along. With no front tyres there is nothing much to steer with.
+
 ## Tuning dials
 
 | Want | Change |
@@ -371,6 +445,16 @@ more than 0.25 m, fewer than 15 frames of anyone stalled inside a junction, no c
 | Signal timing | `Traffic.CYCLE`, `NS_GREEN`, `GAP` |
 | How traffic drives | `TrafficCar.CRUISE_SPEED`, `TURN_SPEED`, `LOOKAHEAD`, `SCAN` |
 | Junction box size | `Traffic.BOX` and `STOP_LINE` |
+| Suspension feel | `Vehicle.SPRING`, `DAMP`, `DIVE`, `LEAN`, `MAX_TILT` |
+| How bad a missing wheel is | `Vehicle.LIMP_TOP`, `LIMP_PULL`, `SCRAPE_DRAG` |
+| How deep a dent goes | `Vehicle.DENT_MAX` |
+| How often the car parks get used | `LotLife.EVERY`, `NEAR`, `MINE` |
+| Who works where | the `Staff.hire` posts in each `Blocks._*` builder, `Staff.UNIFORMS` |
+| Sunrise, sunset, how high the sun gets | `DayNight.SUNRISE`, `SUNSET`, `TILT` |
+| Light colours through the day | `DayNight.DAY_SUN` ... `NIGHT_FOG` |
+| Real lights at once | `DayNight.POOL` (street lamps), `ROOMS_LIT` and `ROOM_RANGE` (rooms) |
+| Windows, and how many light up | the `_facade(...)` options per building: `storey`, `bay`, `win_w`, `lit_share` |
+| Stars, clouds, sky colours | the uniforms at the top of `shaders/sky.gdshader` |
 
 ## Known prototype edges
 
@@ -381,4 +465,5 @@ more than 0.25 m, fewer than 15 frames of anyone stalled inside a junction, no c
 - Ambient traffic yields and queues but does not react to the player driving badly beyond
   stopping for whatever is in front of it.
 - Car handling is deliberately arcade (`CharacterBody3D`, not a physics vehicle) so it
-  stays predictable while iterating.
+  stays predictable while iterating. The springs, dents and wheels are presentation and
+  a handicap on top of that. They do not feed back into grip, so the car cannot roll.

@@ -121,8 +121,14 @@ func rebuild() -> void:
 	for c in get_children():
 		c.queue_free()
 	_wheels.clear()
+	# the old springs are on their way out with everything else; the new body
+	# has to be built on the truck and hung on a fresh set
+	_sprung = null
+	_sparks = null
+	_dents.clear()
 	_build()
 	_rig_wheels()
+	_mount_sprung()
 	_restack()
 
 # ------------------------------------------------------------
